@@ -87,7 +87,10 @@ func dumpLogicWindow() {
         for c in children(e) { walk(c, d + 1) }
     }
     walk(win, 0)
-    log(lines.joined(separator: "\n"))
+    let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+    let url = logURL.deletingLastPathComponent().appendingPathComponent("ShiftPlayhead-구조-\(stamp).txt")
+    try? lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+    log("로직 창 구조 기록 → \(url.lastPathComponent)")
 }
 
 // MARK: - 빈 곳 / 눈금자 찾기
@@ -106,29 +109,51 @@ func rulerPoint(forBackgroundClickAt p: CGPoint, logicPID: pid_t) -> CGPoint? {
           let saFrame = frame(sa) else { return nil }
     // 스크롤 영역 바로 위에 붙어 있는 낮은 AXLayoutArea = 눈금자. 위로 올라가며 찾는다.
     var anc = sa
+    var found: CGPoint?
+    defer { if found == nil { log("빈 곳 Shift-클릭인데 눈금자를 못 찾음 @\(Int(p.x)),\(Int(p.y))") } }
     for _ in 0..<5 {
         guard let up = parent(anc) else { break }
         anc = up
         if let r = findRuler(in: anc, above: saFrame, depth: 0) {
-            return CGPoint(x: p.x, y: r.minY + r.height * 0.75)
+            let band = rulerBand(r)
+            found = CGPoint(x: p.x, y: band.minY + band.height * 0.75)
+            return found
         }
     }
     return nil
 }
 
-func findRuler(in e: AXUIElement, above sa: CGRect, depth: Int) -> CGRect? {
+/// 트랙 영역 바로 위에 붙은 AXLayoutArea = 눈금자. 글로벌 트랙을 펼치면 눈금자와 글로벌 트랙이
+/// 한 덩어리가 되어 키가 커지므로 높이로 거르지 않는다. 진짜 눈금자 띠는 rulerBand로 잘라 낸다.
+func findRuler(in e: AXUIElement, above sa: CGRect, depth: Int) -> (AXUIElement, CGRect)? {
     if depth > 4 || Date() > searchDeadline { return nil }
     for c in children(e) {
         if str(c, kAXRoleAttribute) == "AXLayoutArea", let f = frame(c),
-           f.height < 70, abs(f.maxY - sa.minY) < 4, abs(f.minX - sa.minX) < 4 { return f }
+           abs(f.maxY - sa.minY) < 4, abs(f.minX - sa.minX) < 4 { return (c, f) }
         if let r = findRuler(in: c, above: sa, depth: depth + 1) { return r }
     }
     return nil
 }
 
+/// 눈금자 덩어리에서 글로벌 트랙 줄이 시작되기 전까지의 윗부분. 글로벌 트랙이 닫혀 있으면 전체.
+/// 글로벌 트랙 줄(가로로 긴 AXButton·AXLayoutArea)의 가장 위쪽 시작점에서 자른다.
+/// 재생헤드·사이클·시작/끝 표시(AXValueIndicator, AXLayoutItem)는 눈금자 안에 있으므로 빼고 본다.
+func rulerBand(_ r: (AXUIElement, CGRect)) -> CGRect {
+    let (ruler, f) = r
+    var bottom = f.maxY
+    for c in children(ruler) {
+        let role = str(c, kAXRoleAttribute)
+        guard role == "AXButton" || role == "AXLayoutArea", let cf = frame(c),
+              cf.width > f.width * 0.5, cf.minY > f.minY + 20 else { continue }
+        bottom = min(bottom, cf.minY)
+    }
+    return CGRect(x: f.minX, y: f.minY, width: f.width, height: bottom - f.minY)
+}
+
 // MARK: - 이벤트 탭
 
 let myTag: Int64 = 0x5348_4950   // 우리가 보낸 이벤트 표시 ("SHIP")
+let backTag: Int64 = myTag + 1   // 그중 마지막 "원래 자리로 이동" 이벤트
 var tap: CFMachPort?
 var enabled = true
 var pendingDown: CGEvent?        // 붙잡아 둔 Shift-클릭 (드래그로 바뀌면 그대로 돌려보낸다)
@@ -152,10 +177,10 @@ let eventSource: CGEventSource? = {
     return src
 }()
 
-func post(_ type: CGEventType, at p: CGPoint) {
+func post(_ type: CGEventType, at p: CGPoint, tag: Int64 = myTag) {
     guard let e = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: p, mouseButton: .left) else { return }
     e.flags = []
-    e.setIntegerValueField(.eventSourceUserData, value: myTag)
+    e.setIntegerValueField(.eventSourceUserData, value: tag)
     e.post(tap: .cghidEventTap)
 }
 
@@ -170,19 +195,32 @@ func cursorNow() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
 /// 눈금자를 클릭하고 커서를 원래 자리로 돌려놓는다.
 /// 클릭 뒤에 "원래 자리로 이동" 이벤트를 이어 보내면 화면의 커서는 돌아오지만, 맥이 기억하는
 /// 실제 마우스 위치는 눈금자에 남아 다음 움직임에서 커서가 위로 튄다.
-/// → 잠시 뒤 지금 커서 자리로 워프해 둘을 맞춘다. 워프 뒤 입력 막힘은 0초로 꺼 둔다.
+/// → 지금 커서 자리로 워프해 둘을 맞춘다. 워프 뒤 입력 막힘은 0초로 꺼 둔다.
+/// 맥이 바쁘면 보낸 이벤트가 늦게 처리되는데, 워프가 그보다 먼저 일어나면 소용없다.
+/// 그래서 정해진 시간 대신, 마지막 "원래 자리로 이동"이 이벤트 탭을 지나가는 걸 보고 맞춘다.
+var pendingSync: (ruler: CGPoint, back: CGPoint, id: Int)?
+var syncCounter = 0
+
 func clickRuler(_ r: CGPoint, returnTo back: CGPoint) {
+    syncCounter += 1
+    let id = syncCounter
+    pendingSync = (r, back, id)
     post(.mouseMoved, at: r)
     post(.leftMouseDown, at: r)
     post(.leftMouseUp, at: r)
-    post(.mouseMoved, at: back)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-        var c = cursorNow()
-        if hypot(c.x - r.x, c.y - r.y) < 40 { c = back }   // 아직 눈금자에 있으면 원래 자리로
-        _ = setSuppression?(0)
-        CGWarpMouseCursorPosition(c)
-        CGAssociateMouseAndMouseCursorPosition(1)
-    }
+    post(.mouseMoved, at: back, tag: backTag)
+    // 혹시 그 이벤트를 못 보더라도 0.3초 뒤에는 맞춘다
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { syncCursor(id) }
+}
+
+func syncCursor(_ id: Int) {
+    guard let s = pendingSync, s.id == id else { return }
+    pendingSync = nil
+    var c = cursorNow()
+    if hypot(c.x - s.ruler.x, c.y - s.ruler.y) < 40 { c = s.back }   // 아직 눈금자에 있으면 원래 자리로
+    _ = setSuppression?(0)
+    CGWarpMouseCursorPosition(c)
+    CGAssociateMouseAndMouseCursorPosition(1)
 }
 
 let callback: CGEventTapCallBack = { _, type, event, _ in
@@ -191,7 +229,15 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
         pendingDown = nil; pendingRuler = nil   // 꺼진 사이 손 떼는 신호를 놓쳤을 수 있다
         return Unmanaged.passUnretained(event)
     }
-    if event.getIntegerValueField(.eventSourceUserData) == myTag { return Unmanaged.passUnretained(event) }
+    let tag = event.getIntegerValueField(.eventSourceUserData)
+    if tag == backTag, let s = pendingSync {
+        // 보낸 이벤트가 모두 처리됐다 → 이제 맞춘다
+        let id = s.id
+        DispatchQueue.main.async { syncCursor(id) }
+        return Unmanaged.passUnretained(event)
+    }
+    if tag == myTag || tag == backTag { return Unmanaged.passUnretained(event) }
+    if type == .mouseMoved { return Unmanaged.passUnretained(event) }
 
     switch type {
     case .leftMouseDown:
@@ -225,6 +271,7 @@ let callback: CGEventTapCallBack = { _, type, event, _ in
 
 func startTap() -> Bool {
     let mask = (1 << CGEventType.leftMouseDown.rawValue) | (1 << CGEventType.leftMouseUp.rawValue) | (1 << CGEventType.leftMouseDragged.rawValue)
+             | (1 << CGEventType.mouseMoved.rawValue)   // 우리가 보낸 "원래 자리로 이동"을 알아보려고
     guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                     eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: nil) else { return false }
     tap = t
