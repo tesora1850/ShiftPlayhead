@@ -283,9 +283,47 @@ func startTap() -> Bool {
 
 // MARK: - 앱
 
+// MARK: - 업데이트 확인
+// GitHub에 최신 버전 번호만 물어본다. 받고 설치하는 건 사용자가 직접 (손쉬운 사용 권한을 쓰는 앱이라 몰래 바뀌지 않게).
+
+let latestReleaseAPI = URL(string: "https://api.github.com/repos/tesora1850/ShiftPlayhead/releases/latest")!
+let releasesPage = URL(string: "https://github.com/tesora1850/ShiftPlayhead/releases/latest")!
+let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+
+/// "0.10" > "0.9" 처럼 숫자로 비교한다.
+func isNewer(_ a: String, than b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+        if p != q { return p > q }
+    }
+    return false
+}
+
+/// 최신 버전 번호(앞의 v는 뗌)를 돌려준다. 실패하면 nil. 메인 스레드로 돌려준다.
+func fetchLatestVersion(_ done: @escaping (String?) -> Void) {
+    var req = URLRequest(url: latestReleaseAPI, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+        let tag = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["tag_name"] as? String
+        let v = tag.map { $0.hasPrefix("v") ? String($0.dropFirst()) : $0 }
+        DispatchQueue.main.async { done(v) }
+    }.resume()
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     var retry: Timer?
+    var running = false
+    var updateItem: NSMenuItem!
+    var newVersion: String?
+    var updateTimer: Timer?
+
+    /// 메뉴바 표시: 권한 대기 ⇧▶︎? / 꺼짐 ⇧▷ / 켜짐 ⇧▶︎, 새 버전이 있으면 끝에 •
+    func refreshTitle() {
+        let base = !running ? "⇧▶︎?" : (enabled ? "⇧▶︎" : "⇧▷")
+        item.button?.title = newVersion == nil ? base : base + "•"
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -297,25 +335,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "로직 창 구조 기록", action: #selector(dump), keyEquivalent: "")
         menu.addItem(withTitle: "기록 파일 열기", action: #selector(openLog), keyEquivalent: "")
         menu.addItem(.separator())
+        updateItem = NSMenuItem(title: "", action: #selector(openReleases), keyEquivalent: "")
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
+        menu.addItem(withTitle: "업데이트 확인 (지금 \(currentVersion))", action: #selector(checkNow), keyEquivalent: "")
+        menu.addItem(.separator())
         menu.addItem(withTitle: "종료", action: #selector(quit), keyEquivalent: "q")
         item.menu = menu
 
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(opts) { log("손쉬운 사용 권한 대기 중") }
         tryStart()
+
+        checkForUpdates(manual: false)
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
+            self?.checkForUpdates(manual: false)
+        }
+    }
+
+    func checkForUpdates(manual: Bool) {
+        fetchLatestVersion { [weak self] latest in
+            guard let self else { return }
+            if let latest, isNewer(latest, than: currentVersion) {
+                self.newVersion = latest
+                self.updateItem.title = "새 버전 \(latest) 받기…"
+                self.updateItem.isHidden = false
+                self.refreshTitle()
+                log("새 버전 있음: \(latest)")
+                if !manual { return }
+            }
+            guard manual else { return }
+            let alert = NSAlert()
+            if let latest, isNewer(latest, than: currentVersion) {
+                alert.messageText = "새 버전 \(latest)이 있어요"
+                alert.informativeText = "지금 쓰는 버전은 \(currentVersion)이에요. 다운로드 페이지를 열까요?"
+                alert.addButton(withTitle: "열기"); alert.addButton(withTitle: "나중에")
+            } else if latest != nil {
+                alert.messageText = "최신 버전이에요 (\(currentVersion))"
+            } else {
+                alert.messageText = "업데이트를 확인하지 못했어요"
+                alert.informativeText = "인터넷 연결을 확인한 뒤 다시 시도해 주세요."
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn, self.newVersion != nil { self.openReleases() }
+        }
     }
 
     func tryStart() {
-        if AXIsProcessTrusted(), startTap() { log("시작됨"); item.button?.title = "⇧▶︎"; return }
-        item.button?.title = "⇧▶︎?"
+        if AXIsProcessTrusted(), startTap() { log("시작됨"); running = true; refreshTitle(); return }
+        refreshTitle()
         retry = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in self?.tryStart() }
     }
 
     @objc func toggle(_ m: NSMenuItem) {
         enabled.toggle()
         m.state = enabled ? .on : .off
-        item.button?.title = enabled ? "⇧▶︎" : "⇧▷"
+        refreshTitle()
     }
+    @objc func checkNow() { checkForUpdates(manual: true) }
+    @objc func openReleases() { NSWorkspace.shared.open(releasesPage) }
     @objc func dump() { DispatchQueue.global(qos: .utility).async { dumpLogicWindow() } }
     @objc func openLog() { NSWorkspace.shared.open(logURL) }
     @objc func quit() { NSApp.terminate(nil) }
