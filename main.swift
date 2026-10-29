@@ -155,6 +155,10 @@ func rulerBand(_ r: (AXUIElement, CGRect)) -> CGRect {
 let myTag: Int64 = 0x5348_4950   // 우리가 보낸 이벤트 표시 ("SHIP")
 let backTag: Int64 = myTag + 1   // 그중 마지막 "원래 자리로 이동" 이벤트
 var tap: CFMachPort?
+var tapSource: CFRunLoopSource?
+var recentDisables: [Date] = []
+/// 탭을 걷어냈을 때 알려 줄 곳 (메뉴바 표시를 바꾸고 다시 시도하게)
+var onTapStopped: ((TimeInterval) -> Void)?
 var enabled = true
 var pendingDown: CGEvent?        // 붙잡아 둔 Shift-클릭 (드래그로 바뀌면 그대로 돌려보낸다)
 var pendingRuler: CGPoint?
@@ -225,8 +229,19 @@ func syncCursor(_ id: Int) {
 
 let callback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
         pendingDown = nil; pendingRuler = nil   // 꺼진 사이 손 떼는 신호를 놓쳤을 수 있다
+        // 권한이 꺼져서 꺼진 탭을 다시 켜면, 맥이 끄고 우리가 켜기를 되풀이하며 클릭·키보드가 통째로 멈춘다.
+        // → 진짜 권한 시험(canTapEvents)을 통과할 때만, 그리고 1분에 두 번까지만 다시 켠다. 아니면 걷어낸다.
+        let now = Date()
+        recentDisables = recentDisables.filter { now.timeIntervalSince($0) < 60 } + [now]
+        let why = type == .tapDisabledByTimeout ? "시간 초과" : "사용자 입력"
+        DispatchQueue.main.async {
+            guard let t = tap else { return }
+            if recentDisables.count >= 3 { stopTap(reason: "탭이 1분에 \(recentDisables.count)번 꺼짐 (\(why))", retryAfter: 10); return }
+            if !canTapEvents() { stopTap(reason: "탭이 꺼짐, 권한 없음 (\(why))"); return }
+            log("탭이 꺼져서 다시 켬 (\(why))")
+            CGEvent.tapEnable(tap: t, enable: true)
+        }
         return Unmanaged.passUnretained(event)
     }
     let tag = event.getIntegerValueField(.eventSourceUserData)
@@ -276,9 +291,34 @@ func startTap() -> Bool {
                                     eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: nil) else { return false }
     tap = t
     let src = CFMachPortCreateRunLoopSource(nil, t, 0)
+    tapSource = src
     CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
     CGEvent.tapEnable(tap: t, enable: true)
     return true
+}
+
+/// 손쉬운 사용 권한이 지금 실제로 있는지. AXIsProcessTrusted()는 실행 중에 권한을 꺼도 계속 true를
+/// 돌려줄 때가 있어 믿을 수 없다 → 거의 안 쓰는 이벤트만 보는 시험용 탭을 만들어 보고 바로 없앤다.
+func canTapEvents() -> Bool {
+    let mask = CGEventMask(1 << CGEventType.tabletProximity.rawValue)
+    guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .defaultTap,
+                                    eventsOfInterest: mask, callback: { _, _, e, _ in Unmanaged.passUnretained(e) },
+                                    userInfo: nil) else { return false }
+    CGEvent.tapEnable(tap: t, enable: false)
+    CFMachPortInvalidate(t)
+    return true
+}
+
+/// 탭을 완전히 걷어낸다. 이 뒤로는 클릭이 이 앱을 거치지 않는다.
+func stopTap(reason: String, retryAfter: TimeInterval = 2) {
+    guard let t = tap else { return }
+    CGEvent.tapEnable(tap: t, enable: false)
+    if let src = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+    CFMachPortInvalidate(t)
+    tap = nil; tapSource = nil
+    pendingDown = nil; pendingRuler = nil
+    log("멈춤: \(reason)")
+    onTapStopped?(retryAfter)
 }
 
 // MARK: - 앱
@@ -294,7 +334,7 @@ let releasesPage = URL(string: "https://github.com/tesora1850/ShiftPlayhead/rele
 var updateFeed: URL { UserDefaults.standard.string(forKey: "UpdateFeedURL").flatMap(URL.init(string:)) ?? defaultFeed }
 let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
 /// 새 버전이 갖춰야 할 서명: 이 앱 ID + ShiftPlayhead 전용 인증서
-let updateRequirement = #"identifier "io.github.tesora1850.shiftplayhead" and certificate leaf = H"c3e82f6099608d5834e676020af957bc63df3a4f""#
+let updateRequirement = #"identifier "io.github.tesora1850.shiftplayhead" and certificate leaf = H"e4b5718e470819ff474a9b74267a4cb961e0fa7e""#
 
 /// "0.10" > "0.9" 처럼 숫자로 비교한다.
 func isNewer(_ a: String, than b: String) -> Bool {
@@ -383,6 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var newRelease: Release?
     var installing = false
     var updateTimer: Timer?
+    var trustWatch: Timer?
 
     /// 메뉴바 표시: 권한 대기 ⇧▶︎? / 꺼짐 ⇧▷ / 켜짐 ⇧▶︎, 새 버전이 있으면 끝에 •
     func refreshTitle() {
@@ -408,6 +449,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "종료", action: #selector(quit), keyEquivalent: "q")
         item.menu = menu
+
+        // 권한이 꺼지면 바로 탭을 걷어낸다 (손쉬운 사용 목록이 바뀔 때 오는 알림 + 1초마다 확인)
+        onTapStopped = { [weak self] after in
+            guard let self, self.running else { return }
+            self.running = false
+            self.refreshTitle()
+            self.retry?.invalidate()
+            self.retry = Timer.scheduledTimer(withTimeInterval: after, repeats: false) { [weak self] _ in self?.tryStart() }
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.accessibility.api"),
+                                                            object: nil, queue: .main) { _ in
+            for delay in [0.0, 0.3, 1.0] {   // 권한 상태가 늦게 반영될 수 있어 몇 번 본다
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    if tap != nil && !canTapEvents() { stopTap(reason: "손쉬운 사용 권한이 꺼짐 (알림)") }
+                }
+            }
+        }
+        trustWatch = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            if tap != nil && !canTapEvents() { stopTap(reason: "손쉬운 사용 권한이 꺼짐 (1초 확인)") }
+        }
 
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(opts) { log("손쉬운 사용 권한 대기 중") }
@@ -470,7 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func tryStart() {
-        if AXIsProcessTrusted(), startTap() { log("시작됨"); running = true; refreshTitle(); return }
+        if tap == nil, canTapEvents(), startTap() { log("시작됨"); running = true; refreshTitle(); return }
         refreshTitle()
         retry = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in self?.tryStart() }
     }
