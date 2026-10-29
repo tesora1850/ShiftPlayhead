@@ -283,12 +283,18 @@ func startTap() -> Bool {
 
 // MARK: - 앱
 
-// MARK: - 업데이트 확인
-// GitHub에 최신 버전 번호만 물어본다. 받고 설치하는 건 사용자가 직접 (손쉬운 사용 권한을 쓰는 앱이라 몰래 바뀌지 않게).
+// MARK: - 업데이트
+// GitHub 최신 릴리스를 확인하고, 사용자가 "업데이트"를 누르면 받아서 바꾸고 다시 켠다.
+// 손쉬운 사용 권한을 쓰는 앱이라, 받은 앱이 이 앱과 같은 인증서로 서명돼 있을 때만 설치한다.
+// 다르거나 문제가 생기면 지금 앱은 그대로 두고 다운로드 페이지만 연다.
 
-let latestReleaseAPI = URL(string: "https://api.github.com/repos/tesora1850/ShiftPlayhead/releases/latest")!
+let defaultFeed = URL(string: "https://api.github.com/repos/tesora1850/ShiftPlayhead/releases/latest")!
 let releasesPage = URL(string: "https://github.com/tesora1850/ShiftPlayhead/releases/latest")!
+/// 시험용으로 다른 주소를 쓸 수 있게 (defaults write io.github.tesora1850.shiftplayhead UpdateFeedURL ...)
+var updateFeed: URL { UserDefaults.standard.string(forKey: "UpdateFeedURL").flatMap(URL.init(string:)) ?? defaultFeed }
 let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+/// 새 버전이 갖춰야 할 서명: 이 앱 ID + ShiftPlayhead 전용 인증서
+let updateRequirement = #"identifier "io.github.tesora1850.shiftplayhead" and certificate leaf = H"c3e82f6099608d5834e676020af957bc63df3a4f""#
 
 /// "0.10" > "0.9" 처럼 숫자로 비교한다.
 func isNewer(_ a: String, than b: String) -> Bool {
@@ -300,15 +306,73 @@ func isNewer(_ a: String, than b: String) -> Bool {
     return false
 }
 
-/// 최신 버전 번호(앞의 v는 뗌)를 돌려준다. 실패하면 nil. 메인 스레드로 돌려준다.
-func fetchLatestVersion(_ done: @escaping (String?) -> Void) {
-    var req = URLRequest(url: latestReleaseAPI, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+struct Release { let version: String; let zipURL: URL? }
+
+/// 최신 릴리스(버전 번호, 앞의 v는 뗌 + ShiftPlayhead.zip 주소). 실패하면 nil. 메인 스레드로 돌려준다.
+func fetchLatestRelease(_ done: @escaping (Release?) -> Void) {
+    var req = URLRequest(url: updateFeed, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
     req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
     URLSession.shared.dataTask(with: req) { data, _, _ in
-        let tag = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["tag_name"] as? String
-        let v = tag.map { $0.hasPrefix("v") ? String($0.dropFirst()) : $0 }
-        DispatchQueue.main.async { done(v) }
+        var rel: Release?
+        if let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let tag = json["tag_name"] as? String {
+            let assets = json["assets"] as? [[String: Any]] ?? []
+            let zip = assets.first { $0["name"] as? String == "ShiftPlayhead.zip" }?["browser_download_url"] as? String
+            rel = Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, zipURL: zip.flatMap(URL.init(string:)))
+        }
+        DispatchQueue.main.async { done(rel) }
     }.resume()
+}
+
+/// 받은 앱의 서명이 updateRequirement와 맞는지 (모든 아키텍처, 엄격하게).
+func hasTrustedSignature(_ app: URL) -> Bool {
+    var code: SecStaticCode?, req: SecRequirement?
+    guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess, let code,
+          SecRequirementCreateWithString(updateRequirement as CFString, [], &req) == errSecSuccess, let req else { return false }
+    let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode)
+    return SecStaticCodeCheckValidity(code, flags, req) == errSecSuccess
+}
+
+/// 새 버전을 받아 지금 앱 자리에 바꿔 넣는다. 끝나면 메인 스레드로 오류 문장(성공이면 nil)을 돌려준다.
+func installUpdate(_ rel: Release, _ done: @escaping (String?) -> Void) {
+    func fail(_ msg: String) { log("업데이트 실패: \(msg)"); DispatchQueue.main.async { done(msg) } }
+    guard let zipURL = rel.zipURL else { return fail("다운로드 파일을 찾지 못했어요.") }
+    let appURL = Bundle.main.bundleURL
+    URLSession.shared.downloadTask(with: zipURL) { tmpZip, response, error in
+        guard let tmpZip, error == nil, (response as? HTTPURLResponse).map({ $0.statusCode == 200 }) ?? true else {
+            return fail("새 버전을 받지 못했어요.")
+        }
+        let fm = FileManager.default
+        do {
+            // 앱과 같은 디스크의 임시 폴더에서 풀어야 바꿔 넣기가 한 번에 된다
+            let work = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: appURL, create: true)
+            defer { try? fm.removeItem(at: work) }
+            let zip = work.appendingPathComponent("ShiftPlayhead.zip")
+            try fm.moveItem(at: tmpZip, to: zip)
+            let unzip = Process()
+            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            unzip.arguments = ["-x", "-k", zip.path, work.appendingPathComponent("new").path]
+            try unzip.run(); unzip.waitUntilExit()
+            let newApp = work.appendingPathComponent("new/ShiftPlayhead.app")
+            guard unzip.terminationStatus == 0, fm.fileExists(atPath: newApp.path) else { return fail("받은 파일을 풀지 못했어요.") }
+            guard hasTrustedSignature(newApp) else { return fail("받은 앱의 서명이 달라서 설치하지 않았어요.") }
+            let newVer = Bundle(url: newApp)?.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+            guard isNewer(newVer, than: currentVersion) else { return fail("받은 앱이 지금보다 새 버전이 아니에요.") }
+            _ = try fm.replaceItemAt(appURL, withItemAt: newApp)
+            log("업데이트 설치: \(currentVersion) → \(newVer)")
+            DispatchQueue.main.async { done(nil) }
+        } catch {
+            fail("앱을 바꾸지 못했어요. (\(error.localizedDescription))")
+        }
+    }.resume()
+}
+
+/// 이 앱이 꺼진 뒤 같은 자리의 (새) 앱을 다시 켠다.
+func relaunch() {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+    p.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundleURL.path]
+    try? p.run()
+    NSApp.terminate(nil)
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -316,13 +380,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var retry: Timer?
     var running = false
     var updateItem: NSMenuItem!
-    var newVersion: String?
+    var newRelease: Release?
+    var installing = false
     var updateTimer: Timer?
 
     /// 메뉴바 표시: 권한 대기 ⇧▶︎? / 꺼짐 ⇧▷ / 켜짐 ⇧▶︎, 새 버전이 있으면 끝에 •
     func refreshTitle() {
         let base = !running ? "⇧▶︎?" : (enabled ? "⇧▶︎" : "⇧▷")
-        item.button?.title = newVersion == nil ? base : base + "•"
+        item.button?.title = newRelease == nil ? base : base + "•"
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -335,7 +400,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "로직 창 구조 기록", action: #selector(dump), keyEquivalent: "")
         menu.addItem(withTitle: "기록 파일 열기", action: #selector(openLog), keyEquivalent: "")
         menu.addItem(.separator())
-        updateItem = NSMenuItem(title: "", action: #selector(openReleases), keyEquivalent: "")
+        menu.autoenablesItems = false
+        updateItem = NSMenuItem(title: "", action: #selector(installNow), keyEquivalent: "")
         updateItem.isHidden = true
         menu.addItem(updateItem)
         menu.addItem(withTitle: "업데이트 확인 (지금 \(currentVersion))", action: #selector(checkNow), keyEquivalent: "")
@@ -347,37 +413,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !AXIsProcessTrustedWithOptions(opts) { log("손쉬운 사용 권한 대기 중") }
         tryStart()
 
-        checkForUpdates(manual: false)
+        // --update-now: 새 버전이 있으면 묻지 않고 설치 (업데이트 시험용)
+        checkForUpdates(manual: false, installRightAway: CommandLine.arguments.contains("--update-now"))
         updateTimer = Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
             self?.checkForUpdates(manual: false)
         }
     }
 
-    func checkForUpdates(manual: Bool) {
-        fetchLatestVersion { [weak self] latest in
+    func checkForUpdates(manual: Bool, installRightAway: Bool = false) {
+        fetchLatestRelease { [weak self] rel in
             guard let self else { return }
-            if let latest, isNewer(latest, than: currentVersion) {
-                self.newVersion = latest
-                self.updateItem.title = "새 버전 \(latest) 받기…"
+            let hasNew = rel.map { isNewer($0.version, than: currentVersion) } ?? false
+            if let rel, hasNew {
+                self.newRelease = rel
+                if !self.installing { self.updateItem.title = "새 버전 \(rel.version) 설치하고 다시 켜기" }
                 self.updateItem.isHidden = false
                 self.refreshTitle()
-                log("새 버전 있음: \(latest)")
-                if !manual { return }
+                log("새 버전 있음: \(rel.version)")
+                if installRightAway { self.installNow(); return }
             }
             guard manual else { return }
             let alert = NSAlert()
-            if let latest, isNewer(latest, than: currentVersion) {
-                alert.messageText = "새 버전 \(latest)이 있어요"
-                alert.informativeText = "지금 쓰는 버전은 \(currentVersion)이에요. 다운로드 페이지를 열까요?"
-                alert.addButton(withTitle: "열기"); alert.addButton(withTitle: "나중에")
-            } else if latest != nil {
+            if let rel, hasNew {
+                alert.messageText = "새 버전 \(rel.version)이 있어요"
+                alert.informativeText = "지금 쓰는 버전은 \(currentVersion)이에요. 받아서 바꾸고 다시 켤까요?"
+                alert.addButton(withTitle: "업데이트"); alert.addButton(withTitle: "나중에")
+            } else if rel != nil {
                 alert.messageText = "최신 버전이에요 (\(currentVersion))"
             } else {
                 alert.messageText = "업데이트를 확인하지 못했어요"
                 alert.informativeText = "인터넷 연결을 확인한 뒤 다시 시도해 주세요."
             }
             NSApp.activate(ignoringOtherApps: true)
-            if alert.runModal() == .alertFirstButtonReturn, self.newVersion != nil { self.openReleases() }
+            if alert.runModal() == .alertFirstButtonReturn, hasNew { self.installNow() }
+        }
+    }
+
+    @objc func installNow() {
+        guard let rel = newRelease, !installing else { return }
+        installing = true
+        updateItem.title = "업데이트 중…"
+        updateItem.isEnabled = false
+        installUpdate(rel) { [weak self] err in
+            guard let self else { return }
+            guard let err else { relaunch(); return }
+            self.installing = false
+            self.updateItem.title = "새 버전 \(rel.version) 설치하고 다시 켜기"
+            self.updateItem.isEnabled = true
+            let alert = NSAlert()
+            alert.messageText = "업데이트하지 못했어요"
+            alert.informativeText = err + "\n지금 앱은 그대로예요. 다운로드 페이지에서 직접 받을 수 있어요."
+            alert.addButton(withTitle: "다운로드 페이지 열기"); alert.addButton(withTitle: "닫기")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn { self.openReleases() }
         }
     }
 

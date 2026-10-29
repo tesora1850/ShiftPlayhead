@@ -3,7 +3,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-IDENTITY="${SIGN_IDENTITY:--}"   # 배포본은 임시 서명 (개인 인증서·이메일이 안 들어가게)
+# ShiftPlayhead 전용 인증서로 서명한다. 서명이 매번 같아야 손쉬운 사용 권한이 유지되고,
+# 앱 안의 업데이트 기능도 같은 인증서로 서명된 새 버전만 설치한다. (인증서 백업: README 아래 "서명 인증서" 참고)
+IDENTITY="${SIGN_IDENTITY:-$(security find-identity -p codesigning | awk '/"ShiftPlayhead Code Signing"/{print $2; exit}')}"
+[ -n "$IDENTITY" ] || { echo "키체인에 'ShiftPlayhead Code Signing' 인증서가 없어요" >&2; exit 1; }
 OUT=dist/ShiftPlayhead.app
 
 rm -rf dist && mkdir -p "$OUT/Contents/MacOS" dist/tmp

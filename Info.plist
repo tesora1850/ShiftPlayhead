@@ -7,7 +7,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.sonsky.shiftplayhead</string>
+	<string>io.github.tesora1850.shiftplayhead</string>
 	<key>CFBundleName</key>
 	<string>ShiftPlayhead</string>
 	<key>CFBundlePackageType</key>
